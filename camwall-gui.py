@@ -401,6 +401,7 @@ class CamwallMainWindow(Gtk.Window):
         treeview.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
 
         treeview.connect("row-activated", self.on_stream_row_activated)
+        treeview.connect("button-press-event", self.on_stream_treeview_button_press)
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -469,12 +470,73 @@ class CamwallMainWindow(Gtk.Window):
             return None
         return model[treeiter][0]
 
+    def _select_stream_by_id(self, sid: str) -> None:
+        """Mark a stream row by ID, if present."""
+        def matcher(model, path, treeiter, target_sid):
+            if model[treeiter][0] == target_sid:
+                self.stream_treeview.set_cursor(path)
+                return True
+            return False
+
+        self.stream_store.foreach(matcher, sid)
+
+    def _show_stream_context_menu(self, event, sid: str) -> None:
+        menu = Gtk.Menu()
+
+        def add_item(label: str, handler):
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", handler, sid)
+            menu.append(item)
+
+        add_item("Vorschau", self._on_stream_menu_preview)
+        add_item("Als Hintergrund setzen", self._on_stream_menu_wallpaper)
+        add_item("Bearbeiten", self._on_stream_menu_edit)
+        add_item("Löschen", self._on_stream_menu_delete)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def on_stream_treeview_button_press(self, treeview, event):
+        if event.button != 3:
+            return False
+
+        hit = treeview.get_path_at_pos(int(event.x), int(event.y))
+        if not hit:
+            return False
+
+        path, column, cell_x, cell_y = hit
+        treeview.grab_focus()
+        treeview.set_cursor(path, column, False)
+
+        model = treeview.get_model()
+        treeiter = model.get_iter(path)
+        sid = model[treeiter][0]
+
+        self._show_stream_context_menu(event, sid)
+        return True
+
     # ------------------------------------------------------------------
     # Streams: Events
     # ------------------------------------------------------------------
 
     def on_stream_row_activated(self, treeview, path, column):
         self.on_edit_stream_clicked(treeview)
+
+    def _on_stream_menu_preview(self, menuitem, sid: str) -> None:
+        self._select_stream_by_id(sid)
+        self.on_preview_stream_clicked(menuitem)
+
+    def _on_stream_menu_wallpaper(self, menuitem, sid: str) -> None:
+        self._select_stream_by_id(sid)
+        self.on_set_wallpaper_for_stream(sid)
+
+    def _on_stream_menu_edit(self, menuitem, sid: str) -> None:
+        self._select_stream_by_id(sid)
+        self.on_edit_stream_clicked(menuitem)
+
+    def _on_stream_menu_delete(self, menuitem, sid: str) -> None:
+        self._select_stream_by_id(sid)
+        self.on_delete_stream_clicked(menuitem)
 
     # ------------------------------------------------------------------
     # Buttons: Stream Hinzufügen / Bearbeiten / Löschen / Vorschau
@@ -698,6 +760,12 @@ class CamwallMainWindow(Gtk.Window):
                 "Bitte installiere 'mpv', um die Vorschau nutzen zu können."
             )
             return
+
+    def on_set_wallpaper_for_stream(self, sid):
+        """Startet camwall-apply.py nur für diesen Stream."""
+        self._show_info_dialog(
+            f"Wallpaper für Stream {sid} wird demnächst implementiert."
+        )
     # ------------------------------------------------------------------
     # TAB 3 – Aufnahme & Screenshots
     # ------------------------------------------------------------------
@@ -780,6 +848,8 @@ class CamwallMainWindow(Gtk.Window):
         self.media_treeview.append_column(col_size)
 
         self.media_treeview.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        self.media_treeview.connect("row-activated", self.on_media_row_activated)
+        self.media_treeview.connect("button-press-event", self.on_media_treeview_button_press)
 
         media_scroll = Gtk.ScrolledWindow()
         media_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -1003,8 +1073,73 @@ class CamwallMainWindow(Gtk.Window):
             return None
         return Path(model[treeiter][0])
 
+    def _select_media_by_path(self, target_path: Path) -> None:
+        """Select a media row by its full path."""
+        def matcher(model, path, treeiter, data):
+            if Path(model[treeiter][0]) == data:
+                self.media_treeview.set_cursor(path)
+                return True
+            return False
+
+        self.media_store.foreach(matcher, target_path)
+
+    def _show_media_context_menu(self, event, media_path: Path) -> None:
+        menu = Gtk.Menu()
+
+        def add_item(label: str, handler):
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", handler, media_path)
+            menu.append(item)
+
+        add_item("Abspielen", self._on_media_menu_play)
+        add_item("Im Ordner öffnen", self._on_media_menu_open_folder)
+        add_item("Umbenennen", self._on_media_menu_rename)
+        add_item("Löschen", self._on_media_menu_delete)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def on_media_treeview_button_press(self, treeview, event):
+        if event.button != 3:
+            return False
+
+        hit = treeview.get_path_at_pos(int(event.x), int(event.y))
+        if not hit:
+            return False
+
+        path, column, cell_x, cell_y = hit
+        treeview.grab_focus()
+        treeview.set_cursor(path, column, False)
+
+        model = treeview.get_model()
+        treeiter = model.get_iter(path)
+        media_path = Path(model[treeiter][0])
+
+        self._show_media_context_menu(event, media_path)
+        return True
+
+    def _on_media_menu_play(self, menuitem, media_path: Path) -> None:
+        self._select_media_by_path(media_path)
+        self.on_media_play_clicked(menuitem)
+
+    def _on_media_menu_open_folder(self, menuitem, media_path: Path) -> None:
+        self._select_media_by_path(media_path)
+        self.on_media_open_folder_clicked(menuitem)
+
+    def _on_media_menu_rename(self, menuitem, media_path: Path) -> None:
+        self._select_media_by_path(media_path)
+        self.on_media_rename_clicked(media_path)
+
+    def _on_media_menu_delete(self, menuitem, media_path: Path) -> None:
+        self._select_media_by_path(media_path)
+        self.on_media_delete_clicked(menuitem)
+
     def on_media_refresh_clicked(self, button):
         self._load_media_list()
+
+    def on_media_row_activated(self, treeview, path, column):
+        treeview.get_selection().select_path(path)
+        self.on_media_play_clicked(treeview)
 
     def on_media_play_clicked(self, button):
         path = self._get_selected_media_path()
@@ -1054,6 +1189,36 @@ class CamwallMainWindow(Gtk.Window):
             self._load_media_list()
         except Exception as e:
             self._show_error_dialog(f"Fehler beim Löschen:\n{e}")
+
+    def on_media_rename_clicked(self, path: Path):
+        dlg = Gtk.Dialog(
+            title="Aufnahme umbenennen",
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL
+        )
+        dlg.set_default_size(380, 120)
+        box = dlg.get_content_area()
+
+        entry = Gtk.Entry()
+        entry.set_text(path.name)
+        box.add(entry)
+
+        dlg.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Umbenennen", Gtk.ResponseType.OK)
+        dlg.show_all()
+
+        resp = dlg.run()
+        if resp == Gtk.ResponseType.OK:
+            new_name = entry.get_text().strip()
+            if new_name:
+                new_path = path.with_name(new_name)
+                try:
+                    path.rename(new_path)
+                    self._set_status(f'"{path.name}" wurde umbenannt in "{new_name}".')
+                except Exception as e:
+                    self._show_error_dialog(f"Fehler beim Umbenennen:\n{e}")
+        dlg.destroy()
+        self._load_media_list()
 
     def on_media_cleanup_clicked(self, button):
         removed, freed = cleanup_recordings()
