@@ -1,10 +1,34 @@
+# Python-Cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.vscode/
-*.swp
-*.deb
+
+# Backup-Dateien
 *.bak
+*.old
+*~
+
+# Build/Packaging
+build/
+dist/
+*.deb
+camwall_*.deb
+
+# Editor
+.vscode/
+.idea/
+
+# Logs & temp
 *.log
-logs/
+log/
+tmp/
+
+# Legacy files that must stay ignored
+camwall-apply.legacy.py
+camwall-recorder.py
+
+# System files
+.DS_Store
+Thumbs.db
+
