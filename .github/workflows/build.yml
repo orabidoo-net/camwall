@@ -2,8 +2,13 @@ name: Build Camwall Deb Package
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - "main"
 
 jobs:
   build:
@@ -14,10 +19,14 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Extract version from tag
+      if: startsWith(github.ref, 'refs/tags/')
+      run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+    - name: Debug HOME path
       run: |
-        VERSION="${GITHUB_REF#refs/tags/}"
-        VERSION="${VERSION#v}"
-        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "HOME is: $HOME"
+        ls -l $HOME
+  
 
     - name: Install build dependencies
       run: |
@@ -26,18 +35,18 @@ jobs:
 
     - name: Build Camwall Package
       run: |
-        make build VERSION="$VERSION"
+        make build VERSION=${{ env.VERSION }}
 
     - name: Upload DEB Artifact
       uses: actions/upload-artifact@v4
       with:
         name: camwall-deb
-        path: ./camwall_${{ env.VERSION }}_amd64.deb
+        path: ${{ env.HOME }}/camwall_${{ env.VERSION }}_amd64.deb
 
     - name: Create Release
-      uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
       with:
-        files: ./camwall_${{ env.VERSION }}_amd64.deb
+        files: ${{ env.HOME }}/camwall_${{ env.VERSION }}_amd64.deb
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
