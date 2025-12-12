@@ -19,9 +19,11 @@ jobs:
 
     # --- Extract VERSION from tag ---
     - name: Extract version from tag
+      id: version
       run: |
         VERSION="${GITHUB_REF#refs/tags/}"
         VERSION="${VERSION#v}"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
         echo "VERSION=$VERSION" >> $GITHUB_ENV
         echo "Detected VERSION=$VERSION"
 
@@ -42,21 +44,21 @@ jobs:
     # --- Build the package ---
     - name: Build Camwall Package
       run: |
-        make build VERSION="${{ env.VERSION }}"
-        mv $HOME/camwall_${{ env.VERSION }}_amd64.deb $GITHUB_WORKSPACE/
+        make build VERSION="${{ steps.version.outputs.version }}"
+        mv $HOME/camwall_${{ steps.version.outputs.version }}_amd64.deb $GITHUB_WORKSPACE/
 
     # --- Upload Artifact ---
     - name: Upload DEB Artifact
       uses: actions/upload-artifact@v4
       with:
         name: camwall-deb
-        path: camwall_${{ env.VERSION }}_amd64.deb
+        path: camwall_${{ steps.version.outputs.version }}_amd64.deb
 
     # --- Create GitHub Release ---
     - name: Create Release
       uses: softprops/action-gh-release@v1
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: camwall_${{ env.VERSION }}_amd64.deb
+        files: camwall_${{ steps.version.outputs.version }}_amd64.deb
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
