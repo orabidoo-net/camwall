@@ -1,56 +1,63 @@
 #!/usr/bin/env python3
+import sys
 from pathlib import Path
 from datetime import datetime
 
+BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+from modules.paths import LOG_PATH
 from modules.config_loader import load_config
-from modules.monitor_info import monitors_from_config
+from modules.monitor_info import get_xrandr_geometries
 from modules.stream_resolver import resolve_stream
 from modules.wallpaper_engine import kill_existing, start_wallpaper
 
-LOG_PATH = Path.home() / ".local" / "share" / "camwall" / "camwall.log"
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def log(msg: str) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"[{ts}] {msg}\n")
 
+
 def main():
-    log("=== camwall-apply (modular) gestartet ===")
+    log("=== camwall-apply gestartet ===")
 
-    cfg = load_config()
-    if not cfg:
-        log("Keine Config geladen, breche ab.")
-        return
+    config = load_config()
+    monitor_geometries = get_xrandr_geometries()
 
-    # Alte Instanzen beenden
-    kill_existing(log=log)
+    kill_existing(log)
 
-    streams = cfg.get("streams", {})
-    monitors = monitors_from_config(cfg)
+    streams = config.get("streams", {})
+    monitors_cfg = config.get("monitors", {})
 
-    for mon in monitors:
-        if mon.stream_id == "none":
-            log(f"Monitor {mon.id}: kein Stream zugeordnet, überspringe.")
+    for monitor_id in ("left", "right"):
+        mon_conf = monitors_cfg.get(monitor_id, {})
+        stream_id = mon_conf.get("stream_id", "none")
+        if stream_id == "none":
+            log(f"{monitor_id}: kein Stream zugeordnet, überspringe.")
             continue
 
-        stream = streams.get(mon.stream_id)
+        stream = streams.get(stream_id)
         if not stream:
-            log(f"Monitor {mon.id}: Stream '{mon.stream_id}' nicht in Config gefunden.")
+            log(f"{monitor_id}: Stream '{stream_id}' nicht gefunden.")
             continue
 
-        url = resolve_stream(stream, log=log)
+        geometry = monitor_geometries.get(monitor_id)
+        if not geometry:
+            log(f"{monitor_id}: keine Geometrie gefunden, überspringe.")
+            continue
+
+        url = resolve_stream(stream, log)
         if not url:
-            log(f"Monitor {mon.id}: konnte URL für Stream '{mon.stream_id}' nicht ermitteln.")
+            log(f"{monitor_id}: konnte URL für Stream '{stream_id}' nicht ermitteln.")
             continue
 
-        if not mon.geometry:
-            log(f"Monitor {mon.id}: keine Geometrie gesetzt.")
-            continue
+        start_wallpaper(monitor_id, geometry, url, log)
 
-        start_wallpaper(mon.geometry, url, log=log)
+    log("=== camwall-apply beendet ===")
 
-    log("=== camwall-apply (modular) beendet (Hintergründe laufen im Hintergrund) ===")
 
 if __name__ == "__main__":
     main()

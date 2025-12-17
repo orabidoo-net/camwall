@@ -1,25 +1,44 @@
+import copy
 import json
-import os
+from typing import Dict, Any
 
-CONFIG_PATH = os.path.expanduser("~/.config/camwall/config.json")
+from modules.paths import CONFIG_PATH
 
-def load_config():
-    """Lädt die Camwall-Konfiguration."""
-    if not os.path.exists(CONFIG_PATH):
-        return {"monitors": {}}
+DEFAULT_CONFIG = {
+    "streams": {},
+    "monitors": {
+        "left": {"stream_id": "none", "overlay_autostart": False},
+        "right": {"stream_id": "none", "overlay_autostart": False},
+    },
+}
+
+
+def _default_config() -> Dict[str, Any]:
+    return copy.deepcopy(DEFAULT_CONFIG)
+
+
+def load_config() -> Dict[str, Any]:
+    cfg = _default_config()
+    if not CONFIG_PATH.exists():
+        return cfg
 
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"[config_loader] Fehler beim Laden der Konfiguration: {e}")
-        return {"monitors": {}}
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return cfg
 
-def save_config(config):
-    """Speichert die Camwall-Konfiguration."""
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
-    except Exception as e:
-        print(f"[config_loader] Fehler beim Speichern der Konfiguration: {e}")
+    if isinstance(data, dict):
+        cfg.update(data)
+
+    monitors = cfg.setdefault("monitors", {})
+    monitors.setdefault("left", {"stream_id": "none", "overlay_autostart": False})
+    monitors.setdefault("right", {"stream_id": "none", "overlay_autostart": False})
+    cfg.setdefault("streams", {})
+    return cfg
+
+
+def save_config(config: Dict[str, Any]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CONFIG_PATH.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)

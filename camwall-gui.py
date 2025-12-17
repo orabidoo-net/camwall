@@ -348,9 +348,18 @@ class CamwallMainWindow(Gtk.Window):
         self.monitor_controller.save_monitors()
         log("Konfiguration gespeichert, starte camwall-apply.py")
 
+        candidates = [
+            Path(__file__).resolve().with_name("camwall-apply.py"),
+            Path("/usr/local/bin/camwall-apply"),
+            Path(__file__).resolve().with_name("camwall-apply.py"),
+        ]
+        apply_path = next((p for p in candidates if p.exists()), None)
         try:
+            if not apply_path:
+                raise FileNotFoundError("Kein camwall-apply gefunden.")
+
             subprocess.Popen(
-                ["/usr/bin/env", "python3", "/opt/camwall/camwall-apply.py"],
+                [sys.executable, str(apply_path)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
