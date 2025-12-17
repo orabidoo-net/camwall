@@ -1,60 +1,84 @@
 import gi
-
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import Gtk
 
 
 class MonitorTab(Gtk.Box):
-    """Tab für Monitor-Konfiguration."""
-
     def __init__(self, main_window):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=8)
-        self.main_window = main_window
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.main = main_window
 
         info = Gtk.Label(
-            label=(
-                "Wähle für jeden Monitor den gewünschten Stream.\n"
-                "„(kein Stream)“ lässt den normalen Hintergrund aktiv.\n"
-                "Optional kann das Overlay-Icon automatisch starten."
-            ),
+            label="Wähle pro Monitor einen Stream und optional Overlay-Autostart. "
+                  "Mit „Refresh“ werden die Hintergründe neu gestartet.",
             xalign=0,
         )
-        info.set_justify(Gtk.Justification.LEFT)
         self.pack_start(info, False, False, 0)
 
-        self._build_monitor_rows()
+        # Header row
+        header = Gtk.Grid(column_spacing=12, row_spacing=6)
+        header.attach(Gtk.Label(label="<b>Monitor</b>", use_markup=True, xalign=0), 0, 0, 1, 1)
+        header.attach(Gtk.Label(label="<b>Stream</b>", use_markup=True, xalign=0), 1, 0, 1, 1)
+        header.attach(Gtk.Label(label="<b>Overlay</b>", use_markup=True, xalign=0), 2, 0, 1, 1)
+        header.attach(Gtk.Label(label="<b>Aktionen</b>", use_markup=True, xalign=0), 3, 0, 1, 1)
+        self.pack_start(header, False, False, 0)
 
-    def _build_monitor_rows(self) -> None:
-        main = self.main_window
-        monitor_items = list(main.monitors.items())
-        if hasattr(main, "log"):
-            main.log(
-                f"monitors_from_config -> {[(k, v.get('name'), v.get('stream_id')) for k, v in monitor_items]}"
+        frame = Gtk.Frame()
+        self.pack_start(frame, True, True, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(10)
+        frame.add(outer)
+
+        monitors = self.main.monitors or {}
+        if not monitors:
+            outer.pack_start(
+                Gtk.Label(label="Keine Monitore in der Konfiguration gefunden.", xalign=0),
+                False, False, 0
             )
+            self.show_all()
+            return
 
-        for mon_id, mconf in monitor_items:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            self.pack_start(row, False, False, 0)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        outer.pack_start(grid, False, False, 0)
 
+        row = 0
+        for mon_id, mconf in monitors.items():
             name = mconf.get("name", mon_id)
-            stream_id = mconf.get("stream_id", "none")
+            geom = mconf.get("geometry", "")
+            stream_id = mconf.get("stream_id", "none") or "none"
             overlay_autostart = bool(mconf.get("overlay_autostart", False))
 
-            lbl = Gtk.Label(label=name + ":", xalign=0)
-            lbl.set_size_request(140, -1)
-            row.pack_start(lbl, False, False, 0)
+            mon_label = Gtk.Label(label=f"{name}\n<small>{geom}</small>", use_markup=True, xalign=0)
+            grid.attach(mon_label, 0, row, 1, 1)
 
             combo = Gtk.ComboBoxText()
-            combo.set_hexpand(True)
-            combo.set_tooltip_text(
-                f"Stream für Monitor „{name}“ auswählen."
-            )
-            main._fill_monitor_combo(combo, stream_id)
-            row.pack_start(combo, True, True, 0)
+            self.main._fill_monitor_combo(combo, stream_id)
+            grid.attach(combo, 1, row, 1, 1)
 
-            chk_overlay = Gtk.CheckButton(label="Overlay automatisch starten")
-            chk_overlay.set_active(overlay_autostart)
-            row.pack_start(chk_overlay, False, False, 0)
+            chk = Gtk.CheckButton(label="Autostart")
+            chk.set_active(overlay_autostart)
+            grid.attach(chk, 2, row, 1, 1)
 
-            main.monitor_combo_widgets[mon_id] = combo
-            main.monitor_overlay_check_widgets[mon_id] = chk_overlay
+            btn_refresh = Gtk.Button(label="Refresh")
+            btn_refresh.set_tooltip_text("Startet nur diesen Monitor neu (Hintergrund/Stream neu starten).")
+            btn_refresh.connect("clicked", lambda _b, mid=mon_id: self.main.refresh_wallpapers(monitor_id=mid))
+            grid.attach(btn_refresh, 3, row, 1, 1)
+
+            # Referenzen zurück ins MainWindow, damit Apply lesen kann
+            self.main.monitor_combo_widgets[mon_id] = combo
+            self.main.monitor_overlay_check_widgets[mon_id] = chk
+
+            row += 1
+
+        # Refresh all
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        outer.pack_start(actions, False, False, 0)
+        actions.pack_start(Gtk.Label(), True, True, 0)
+
+        btn_refresh_all = Gtk.Button(label="Refresh (alle)")
+        btn_refresh_all.set_tooltip_text("Startet alle Monitore neu.")
+        btn_refresh_all.connect("clicked", lambda _b: self.main.refresh_wallpapers())
+        actions.pack_start(btn_refresh_all, False, False, 0)
+
+        self.show_all()

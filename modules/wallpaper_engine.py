@@ -50,8 +50,17 @@ def _is_running(pid: int) -> bool:
     return True
 
 
-def kill_existing(log) -> None:
+def kill_existing(log, only: set[str] | None = None) -> None:
+    """
+    Beendet bestehende Wallpaper-Prozesse.
+    Wenn `only` gesetzt ist, werden nur PID-Dateien für diese Monitor-IDs beendet.
+    """
     for pidfile in PID_DIR.glob("*.pid"):
+        mon_id = pidfile.stem
+
+        if only is not None and mon_id not in only:
+            continue
+
         try:
             pid = int(pidfile.read_text().strip())
         except Exception:
@@ -91,7 +100,6 @@ def _stderr_worker(proc: subprocess.Popen, log, monitor_id: str) -> None:
             if ("xwinwrap WID=" in line) or WALLPAPER_DEBUG:
                 _log(log, f"[{monitor_id}] {line}")
     except Exception:
-        # bewusst still: niemals den Wallpaper-Start wegen Logging killen
         pass
 
 
@@ -106,8 +114,6 @@ def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
         _log(log, "mpv nicht gefunden, breche ab.")
         return
 
-    # Shell-Skript: WID kommt als $1 rein (xwinwrap ersetzt "WID" → 0x....).
-    # URL kommt als $2 rein (wird als Argument übergeben, nicht im Skript interpoliert).
     mpv_args = " ".join(shlex.quote(a) for a in MPV_BASE_ARGS)
     script = f'echo "xwinwrap WID=$1" >&2; exec "$MPV" {mpv_args} --wid="$1" "$2"'
 
@@ -132,7 +138,6 @@ def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
         env=env,
     )
 
-    # Wenn xwinwrap sofort stirbt, error aufnehmen
     if proc.poll() is not None:
         try:
             err = proc.stderr.read() if proc.stderr else ""
@@ -141,7 +146,6 @@ def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
         _log(log, f"xwinwrap exited immediately (code {proc.returncode}): {err.strip()}")
         return
 
-    # stderr-Drain + WID-Logging
     t = threading.Thread(target=_stderr_worker, args=(proc, log, monitor_id), daemon=True)
     t.start()
 

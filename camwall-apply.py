@@ -21,18 +21,28 @@ def log(msg: str) -> None:
         f.write(f"[{ts}] {msg}\n")
 
 
+def _parse_targets(argv) -> list[str]:
+    valid = {"left", "right"}
+    targets = [a for a in argv[1:] if a in valid]
+    return targets or ["left", "right"]
+
+
 def main():
     log("=== camwall-apply gestartet ===")
+
+    targets = _parse_targets(sys.argv)
+    log(f"Targets: {targets}")
 
     config = load_config()
     monitor_geometries = get_xrandr_geometries()
 
-    kill_existing(log)
+    # Nur die gewünschten Monitore killen (oder alle, wenn targets=left+right)
+    kill_existing(log, only=set(targets))
 
     streams = config.get("streams", {})
     monitors_cfg = config.get("monitors", {})
 
-    for monitor_id in ("left", "right"):
+    for monitor_id in targets:
         mon_conf = monitors_cfg.get(monitor_id, {})
         stream_id = mon_conf.get("stream_id", "none")
         if stream_id == "none":
