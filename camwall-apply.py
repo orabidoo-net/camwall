@@ -21,26 +21,30 @@ def log(msg: str) -> None:
         f.write(f"[{ts}] {msg}\n")
 
 
-def _parse_targets(argv) -> list[str]:
-    valid = {"left", "right"}
-    targets = [a for a in argv[1:] if a in valid]
-    return targets or ["left", "right"]
+def _parse_targets(argv: list[str], monitors_cfg: dict) -> list[str]:
+    # akzeptiert left/right (und ignoriert Müll)
+    allowed = set(monitors_cfg.keys()) if monitors_cfg else {"left", "right"}
+    targets = [a.strip() for a in argv if a.strip() in allowed]
+    return targets
 
 
 def main():
     log("=== camwall-apply gestartet ===")
 
-    targets = _parse_targets(sys.argv)
-    log(f"Targets: {targets}")
-
     config = load_config()
     monitor_geometries = get_xrandr_geometries()
 
-    # Nur die gewünschten Monitore killen (oder alle, wenn targets=left+right)
-    kill_existing(log, only=set(targets))
-
     streams = config.get("streams", {})
     monitors_cfg = config.get("monitors", {})
+
+    targets = _parse_targets(sys.argv[1:], monitors_cfg)
+    if not targets:
+        targets = ["left", "right"]
+
+    log(f"Targets: {targets}")
+
+    # Wichtig: nur die Ziel-Monitore killen (sonst reloaden beide)
+    kill_existing(log, targets)
 
     for monitor_id in targets:
         mon_conf = monitors_cfg.get(monitor_id, {})
