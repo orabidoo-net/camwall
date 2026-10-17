@@ -42,5 +42,22 @@ Da das Tool `xwinwrap` nicht in den offiziellen Ubuntu/Mint-Paketquellen enthalt
 
 ### 2. Debian-Paket installieren
 Lade dir die aktuelle `.deb`-Datei aus den [Releases](../../releases/latest) herunter und installiere sie im Terminal:
+
 ```bash
 sudo apt install ./camwall_1.8.0_all.deb
+```
+
+*Hinweis: Alle anderen Abhängigkeiten (`mpv`, `yt-dlp`, `python3-gi`, etc.) erkennt und installiert das Paket völlig automatisch.*
+
+### 3. Autostart & Systemintegration
+Das Paket richtet automatisch einen Eintrag in deinem Startmenü ein. Zudem wird der Watchdog in den System-Autostart (`/etc/xdg/autostart`) gelegt, sodass Camwall nach einem PC-Neustart sofort lautlos im Hintergrund wacht und einsatzbereit ist.
+
+---
+
+## 🛠️ Für Entwickler (Manuelles Bauen)
+Camwall bringt ein eigenes Build-Skript mit, um das `.deb`-Paket bei Code-Änderungen selbst zu kompilieren:
+
+```bash
+chmod +x build_deb.sh
+./build_deb.sh
+```
