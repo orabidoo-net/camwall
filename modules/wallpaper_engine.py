@@ -24,9 +24,11 @@ XWINWRAP_BASE_ARGS = [
     "-nf",
 ]
 
+# Hinweis: --no-audio haben wir hier entfernt! 
+# mpv startet stattdessen standardmäßig mit Ton, aber WIR schalten ihn im Shell-Skript 
+# sofort stumm (--mute=yes). So können wir ihn später per IPC wieder einschalten.
 MPV_BASE_ARGS = [
     "--no-config",
-    "--no-audio",
     "--loop=inf",
     "--no-border",
     "--no-osc",
@@ -53,10 +55,7 @@ def _is_running(pid: int) -> bool:
 
 def kill_existing(log, monitor_ids: Iterable[str] | None = None) -> None:
     """
-    Beendet bestehende Wallpaper-Prozesse.
-
-    Wenn monitor_ids angegeben ist, werden NUR diese Monitore beendet.
-    Andernfalls werden alle *.pid in PID_DIR beendet.
+    Beendet bestehende Wallpaper-Prozesse und räumt IPC-Sockets auf.
     """
     targets = None
     if monitor_ids is not None:
@@ -91,6 +90,14 @@ def kill_existing(log, monitor_ids: Iterable[str] | None = None) -> None:
                 _log(log, f"SIGKILL für PID {pid} fehlgeschlagen: {e}")
 
         pidfile.unlink(missing_ok=True)
+        
+        # Alten IPC-Socket des Monitors aufräumen
+        socket_path = f"/tmp/camwall_{mon_id}.sock"
+        try:
+            if os.path.exists(socket_path):
+                os.remove(socket_path)
+        except Exception:
+            pass
 
 
 def _stderr_worker(proc: subprocess.Popen, log, monitor_id: str) -> None:
@@ -106,7 +113,6 @@ def _stderr_worker(proc: subprocess.Popen, log, monitor_id: str) -> None:
             if ("xwinwrap WID=" in line) or WALLPAPER_DEBUG:
                 _log(log, f"[{monitor_id}] {line}")
     except Exception:
-        # bewusst still: niemals den Wallpaper-Start wegen Logging killen
         pass
 
 
@@ -121,10 +127,13 @@ def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
         _log(log, "mpv nicht gefunden, breche ab.")
         return
 
-    # Shell-Skript: WID kommt als $1 rein (xwinwrap ersetzt "WID" → 0x....).
-    # URL kommt als $2 rein (wird als Argument übergeben, nicht im Skript interpoliert).
+    socket_path = f"/tmp/camwall_{monitor_id}.sock"
+
+    # Shell-Skript:
+    # 1. Wir aktivieren den IPC Server (die "Fernbedienung").
+    # 2. Wir starten initial mit --mute=yes (Ton ist da, aber stummgeschaltet, bereit zum Unmuten!).
     mpv_args = " ".join(shlex.quote(a) for a in MPV_BASE_ARGS)
-    script = f'echo "xwinwrap WID=$1" >&2; exec "$MPV" {mpv_args} --wid="$1" "$2"'
+    script = f'echo "xwinwrap WID=$1" >&2; exec "$MPV" {mpv_args} --mute=yes --input-ipc-server="{socket_path}" --wid="$1" "$2"'
 
     cmd = [
         xwinwrap_path,
@@ -147,7 +156,6 @@ def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
         env=env,
     )
 
-    # Wenn xwinwrap sofort stirbt, error aufnehmen
     if proc.poll() is not None:
         try:
             err = proc.stderr.read() if proc.stderr else ""
@@ -156,7 +164,6 @@ def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
         _log(log, f"xwinwrap exited immediately (code {proc.returncode}): {err.strip()}")
         return
 
-    # stderr-Drain + WID-Logging
     t = threading.Thread(target=_stderr_worker, args=(proc, log, monitor_id), daemon=True)
     t.start()
 

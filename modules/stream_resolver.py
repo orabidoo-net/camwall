@@ -1,6 +1,5 @@
 import subprocess
 
-
 def resolve_stream(stream: dict, log) -> str:
     if not stream:
         return ""
@@ -12,11 +11,23 @@ def resolve_stream(stream: dict, log) -> str:
     if not url:
         return ""
 
+    # Wir lesen jetzt den eingestellten Typ und Browser sauber aus!
+    stype = stream.get("type", "youtube")
+    browser = stream.get("browser", "firefox")
+
     if "youtube.com" in url or "youtu.be" in url:
-        log(f"resolve_stream: starte yt-dlp für {url}")
+        log(f"resolve_stream: starte yt-dlp für {url} (Typ: {stype})")
+        
+        # Standard-Befehl OHNE Cookies (für normale Webcams)
+        cmd = ["yt-dlp", "-g", url]
+        
+        # Nur wenn explizit gewünscht, hängen wir die Cookies an
+        if stype == "youtube_cookies" and browser:
+            cmd = ["yt-dlp", "--cookies-from-browser", browser, "-g", url]
+
         try:
             result = subprocess.run(
-                ["yt-dlp", "--cookies-from-browser", "firefox", "-g", url],
+                cmd,
                 check=False,
                 capture_output=True,
                 text=True,

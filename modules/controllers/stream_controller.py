@@ -14,10 +14,12 @@ class StreamController:
         streams = self.config_service.get_streams()
         return sorted(streams.items(), key=lambda item: item[1].get("name", item[0]).lower())
 
-    def add_stream(self, name: str, url: str, stype: str, browser: str) -> Tuple[str, Dict]:
+    def add_stream(self, name: str, url: str, stype: str, browser: str, location: str = "", timezone: str = "") -> Tuple[str, Dict]:
         name = (name or "").strip()
         url = (url or "").strip()
         browser = (browser or "").strip()
+        location = (location or "").strip()
+        timezone = (timezone or "").strip()
         stype = stype or "direct"
 
         self._validate_stream_fields(name, url, stype, browser)
@@ -35,11 +37,13 @@ class StreamController:
             "url": url,
             "type": stype,
             "browser": browser,
+            "location": location,
+            "timezone": timezone,
         }
         self.config_service.update_stream(sid, conf)
         return sid, conf
 
-    def edit_stream(self, sid: str, name: str, url: str, stype: str, browser: str) -> Dict:
+    def edit_stream(self, sid: str, name: str, url: str, stype: str, browser: str, location: str = "", timezone: str = "") -> Dict:
         streams = self.config_service.get_streams()
         if sid not in streams:
             raise ValueError("Unbekannter Stream.")
@@ -47,6 +51,8 @@ class StreamController:
         name = (name or "").strip()
         url = (url or "").strip()
         browser = (browser or "").strip()
+        location = (location or "").strip()
+        timezone = (timezone or "").strip()
         stype = stype or "direct"
 
         self._validate_stream_fields(name, url, stype, browser)
@@ -56,6 +62,8 @@ class StreamController:
             "url": url,
             "type": stype,
             "browser": browser,
+            "location": location,
+            "timezone": timezone,
         }
         self.config_service.update_stream(sid, conf)
         return conf
