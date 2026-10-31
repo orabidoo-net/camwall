@@ -89,8 +89,28 @@ def is_stream_alive(monitor_id: str) -> bool:
     except Exception:
         return False
 
+def _is_in_external_grace_period(monitor_id: str, grace_seconds: float = 45.0) -> bool:
+    """
+    Prüft, ob die GUI, das Overlay oder camwall-apply.py diesen Monitor (oder
+    CamWall insgesamt) innerhalb der letzten `grace_seconds` Sekunden neu
+    gestartet bzw. aktualisiert hat.
+    """
+    now = time.time()
+    for path in (Path(f"/tmp/camwall_grace_{monitor_id}"), RUN_FILE):
+        try:
+            if path.exists() and (now - path.stat().st_mtime) < grace_seconds:
+                return True
+        except Exception:
+            pass
+    return False
+
 def restart_monitor(monitor_id: str, mconf: dict, reason: str = "Gesundheitscheck"):
     log(f"{reason}: Starte Stream auf Monitor '{monitor_id}' neu...")
+
+    try:
+        Path(f"/tmp/camwall_grace_{monitor_id}").touch(exist_ok=True)
+    except Exception:
+        pass
     
     try:
         apply_cmd = _resolve_apply_target()
@@ -112,13 +132,40 @@ def restart_monitor(monitor_id: str, mconf: dict, reason: str = "Gesundheitschec
 def main():
     log("Watchdog gestartet. Warte auf Aktivierung durch die GUI...")
     executed_schedules = {}  # Speichert, was heute schon ausgeführt wurde (ID -> Datum)
+    # Zeitpunkt, bis zu dem für einen Monitor KEIN Gesundheitscheck
+    # durchgeführt werden darf (monitor_id -> unix timestamp).
+    # Grund für diesen Fix: Direkt nach dem Start von CamWall (Klick auf
+    # "Anwenden" in der GUI) braucht camwall-apply mehrere Sekunden
+    # (yt-dlp-URL-Auflösung + mpv-Start), bis der IPC-Socket eines Monitors
+    # existiert. Der Watchdog prüfte bisher SOFORT beim ersten Schleifen-
+    # durchlauf (ohne Anlaufzeit), hielt den noch startenden Stream
+    # fälschlich für "tot" und löste einen überflüssigen Neustart aus -
+    # genau das war im Test die Ursache dafür, dass beim allerersten
+    # Durchlauf nach dem Start (nur auf dem zuletzt gestarteten Monitor)
+    # das Blinken des Aufnahme-Buttons und der Screenshot-Dialog fehlerhaft
+    # waren: Das Overlay-Fenster dieses Monitors wurde vom Watchdog mitten
+    # im Hochfahren abgeschossen und neu gestartet.
+    health_check_grace_until: dict[str, float] = {}
+    was_active = False
     
     while True:
         # Wenn CamWall "ausgeschaltet" ist (keine Startdatei), dann ignoriere auch die Zeitpläne
         if not RUN_FILE.exists():
+            was_active = False
             time.sleep(10)
             continue
-            
+
+        if not was_active:
+            # CamWall wurde gerade (wieder) aktiviert: Allen aktuell
+            # konfigurierten Monitoren eine Anlaufzeit von 45 Sekunden
+            # geben, bevor der erste Gesundheitscheck greifen darf.
+            was_active = True
+            startup_config = load_json(CONFIG_FILE)
+            grace_deadline = time.time() + 45
+            for mon_id in startup_config.get("monitors", {}):
+                health_check_grace_until[mon_id] = grace_deadline
+            log("CamWall aktiviert: Gesundheitscheck pausiert für 45 Sekunden (Anlaufzeit).")
+
         config = load_json(CONFIG_FILE)
         schedules = load_json(SCHEDULE_FILE)
         
@@ -164,18 +211,30 @@ def main():
         # Monitore neu starten, die vom Zeitplan betroffen waren
         for mon_id in restarted_monitors:
             restart_monitor(mon_id, config["monitors"].get(mon_id, {}), reason="Zeitplan")
-        
-        # 2. GESUNDHEITSCHECK (nur für Monitore, die wir nicht gerade erst neu gestartet haben)
+            # Nach einem Neustart erneut eine Anlaufzeit gewähren, damit der
+            # Gesundheitscheck den frisch gestarteten Stream nicht sofort
+            # wieder fälschlich für "tot" hält.
+            health_check_grace_until[mon_id] = time.time() + 45
+
+        # 2. GESUNDHEITSCHECK (nur für Monitore, die wir nicht gerade erst neu gestartet
+        # haben UND deren Anlaufzeit bereits abgelaufen ist)
         monitors = config.get("monitors", {})
         for monitor_id, mconf in monitors.items():
             if monitor_id in restarted_monitors:
                 continue # Diesen haben wir gerade erst gestartet, der muss nicht geprüft werden
-                
+
+            if time.time() < health_check_grace_until.get(monitor_id, 0):
+                continue # Monitor befindet sich noch in der Anlaufzeit nach dem Start
+
+            if _is_in_external_grace_period(monitor_id):
+                continue # Monitor wird gerade durch GUI / Overlay / camwall-apply neu gestartet
+
             stream_id = mconf.get("stream_id", "none")
             
             if stream_id != "none":
                 if not is_stream_alive(monitor_id):
                     restart_monitor(monitor_id, mconf, reason="Stream tot")
+                    health_check_grace_until[monitor_id] = time.time() + 45
                     time.sleep(5) # Kurze Atempause für das System
                     
         # Schlafzyklus bis zur nächsten Prüfung

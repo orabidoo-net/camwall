@@ -11,6 +11,13 @@ class RecorderController:
         self.main_window = main_window
         self.media_service = media_service
 
+    def _resolve_instance_id_for_stream(self, sid: str) -> str:
+        monitors = getattr(self.main_window, "monitors", None) or {}
+        for mon_id, mconf in monitors.items():
+            if isinstance(mconf, dict) and mconf.get("stream_id") == sid:
+                return mon_id
+        return "default"
+
     def start_recording(self, sid: str, sconf: Dict, title: str) -> Dict:
         if not sconf:
             raise ValueError("Bitte zuerst einen Stream auswählen.")
@@ -27,10 +34,21 @@ class RecorderController:
         if stype == "youtube_cookies" and not browser:
             raise ValueError("Dieser Stream benötigt einen Browser für Cookies.")
 
-        return stream_recorder.start_recording(url, final_title, browser if stype == "youtube_cookies" else None)
+        instance_id = self._resolve_instance_id_for_stream(sid)
+        return stream_recorder.start_recording(
+            url,
+            final_title,
+            browser if stype == "youtube_cookies" else None,
+            instance_id=instance_id,
+        )
 
     def stop_recording(self) -> bool:
-        return stream_recorder.stop_recording()
+        stopped_any = False
+        for instance_id in ("default", "left", "right"):
+            if stream_recorder.is_recording_active(instance_id):
+                if stream_recorder.stop_recording(instance_id):
+                    stopped_any = True
+        return stopped_any
 
     def take_screenshot(self, sid: str, sconf: Dict, title: str) -> Path:
         if not sconf:

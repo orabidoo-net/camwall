@@ -1,13 +1,14 @@
+import json
 import os
 import signal
 import shutil
+import socket
 import subprocess
 import time
-import threading
 import shlex
 from typing import Iterable
 
-from modules.paths import PID_DIR
+from modules.paths import PID_DIR, LOG_PATH
 
 
 # ---- zentrale Defaults -------------------------------------------------------
@@ -53,67 +54,107 @@ def _is_running(pid: int) -> bool:
     return True
 
 
+def _send_ipc_quit(socket_path: str) -> None:
+    if not os.path.exists(socket_path):
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.2)
+            client.connect(socket_path)
+            msg = json.dumps({"command": ["quit"]}) + "\n"
+            client.sendall(msg.encode("utf-8"))
+    except Exception:
+        pass
+
+
+def _kill_pid_or_pgid(pid: int, sig: int) -> None:
+    try:
+        pgid = os.getpgid(pid)
+        if pgid == pid:
+            os.killpg(pgid, sig)
+            return
+    except Exception:
+        pass
+    os.kill(pid, sig)
+
+
 def kill_existing(log, monitor_ids: Iterable[str] | None = None) -> None:
     """
-    Beendet bestehende Wallpaper-Prozesse und räumt IPC-Sockets auf.
+    Beendet bestehende Wallpaper-Prozesse (xwinwrap samt mpv-Kindprozess)
+    und räumt PID-Dateien sowie IPC-Sockets sauber auf.
     """
     targets = None
     if monitor_ids is not None:
-        targets = set(str(x) for x in monitor_ids)
+        targets = set(str(x) for x in monitor_ids if x)
 
+    mon_ids_to_clean: set[str] = set()
     for pidfile in PID_DIR.glob("*.pid"):
         mon_id = pidfile.stem
-        if targets is not None and mon_id not in targets:
-            continue
+        if targets is None or mon_id in targets:
+            mon_ids_to_clean.add(mon_id)
 
+    if targets is not None:
+        mon_ids_to_clean.update(targets)
+    else:
+        mon_ids_to_clean.update({"left", "right"})
+
+    for mon_id in sorted(mon_ids_to_clean):
+        pidfile = PID_DIR / f"{mon_id}.pid"
+        socket_path = f"/tmp/camwall_{mon_id}.sock"
+        pid = None
+
+        if pidfile.exists():
+            try:
+                pid = int(pidfile.read_text().strip())
+            except Exception:
+                pidfile.unlink(missing_ok=True)
+
+        # 1. mpv per IPC zum sauberen Beenden auffordern
+        _send_ipc_quit(socket_path)
+
+        # 2. Prozessgruppe aus PID-Datei mit SIGTERM beenden
+        if pid is not None:
+            _log(log, f"Beende vorhandenen Wallpaper-Prozess PID {pid} (Monitor {mon_id}, Datei: {pidfile.name})")
+            try:
+                _kill_pid_or_pgid(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                _log(log, f"PID {pid} existiert nicht mehr.")
+            except Exception as e:
+                _log(log, f"SIGTERM für PID {pid} fehlgeschlagen: {e}")
+
+        # 3. Verwaiste xwinwrap/mpv-Prozesse dieses Monitors anhand des eindeutigen
+        #    Socket-Pfads im Kommandozeilen-Aufruf ebenfalls mit SIGTERM beenden
         try:
-            pid = int(pidfile.read_text().strip())
+            subprocess.run(["pkill", "-TERM", "-f", socket_path], check=False)
         except Exception:
-            pidfile.unlink(missing_ok=True)
-            continue
+            pass
 
-        _log(log, f"Beende vorhandenen Wallpaper-Prozess PID {pid} (Monitor {mon_id}, Datei: {pidfile.name})")
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            _log(log, f"PID {pid} existiert nicht mehr.")
-        except Exception as e:
-            _log(log, f"SIGTERM für PID {pid} fehlgeschlagen: {e}")
+        # Bis zu 0.6s warten, damit xwinwrap und mpv sauber schließen können
+        for _ in range(6):
+            if pid is None or not _is_running(pid):
+                break
+            time.sleep(0.1)
 
-        time.sleep(0.3)
-
-        if _is_running(pid):
+        if pid is not None and _is_running(pid):
             _log(log, f"PID {pid} läuft noch, sende SIGKILL.")
             try:
-                os.kill(pid, signal.SIGKILL)
+                _kill_pid_or_pgid(pid, signal.SIGKILL)
             except Exception as e:
                 _log(log, f"SIGKILL für PID {pid} fehlgeschlagen: {e}")
 
+        try:
+            subprocess.run(["pkill", "-KILL", "-f", socket_path], check=False)
+        except Exception:
+            pass
+
         pidfile.unlink(missing_ok=True)
-        
+
         # Alten IPC-Socket des Monitors aufräumen
-        socket_path = f"/tmp/camwall_{mon_id}.sock"
         try:
             if os.path.exists(socket_path):
                 os.remove(socket_path)
         except Exception:
             pass
-
-
-def _stderr_worker(proc: subprocess.Popen, log, monitor_id: str) -> None:
-    """
-    Liest stderr kontinuierlich, damit der Pipe nicht vollläuft.
-    Loggt standardmäßig nur die WID-Zeile; im Debug-Modus alles.
-    """
-    try:
-        for line in proc.stderr:
-            line = (line or "").strip()
-            if not line:
-                continue
-            if ("xwinwrap WID=" in line) or WALLPAPER_DEBUG:
-                _log(log, f"[{monitor_id}] {line}")
-    except Exception:
-        pass
 
 
 def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
@@ -148,24 +189,40 @@ def start_wallpaper(monitor_id: str, geometry: str, url: str, log) -> None:
     env["MPV"] = mpv_path
 
     _log(log, f"Starte Wallpaper für Monitor {monitor_id} mit Geometrie {geometry}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
 
+    # Wichtig: Keine offene stderr-Pipe an den kurzlebigen camwall-apply-Prozess
+    # binden (sonst stirbt der Lese-Thread beim Ende von camwall-apply und
+    # xwinwrap/mpv erhalten später SIGPIPE). Zudem start_new_session=True,
+    # damit xwinwrap und mpv eine eigene Prozessgruppe bilden, die komplett
+    # über os.killpg beendet werden kann.
+    stderr_fh = None
+    try:
+        if WALLPAPER_DEBUG:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            stderr_fh = LOG_PATH.open("a", encoding="utf-8")
+            stderr_target = stderr_fh
+        else:
+            stderr_target = subprocess.DEVNULL
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_target,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+    finally:
+        if stderr_fh is not None:
+            try:
+                stderr_fh.close()
+            except Exception:
+                pass
+
+    time.sleep(0.1)
     if proc.poll() is not None:
-        try:
-            err = proc.stderr.read() if proc.stderr else ""
-        except Exception:
-            err = ""
-        _log(log, f"xwinwrap exited immediately (code {proc.returncode}): {err.strip()}")
+        _log(log, f"xwinwrap exited immediately (code {proc.returncode})")
         return
-
-    t = threading.Thread(target=_stderr_worker, args=(proc, log, monitor_id), daemon=True)
-    t.start()
 
     try:
         pidfile = PID_DIR / f"{monitor_id}.pid"

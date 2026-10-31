@@ -12,7 +12,7 @@ class MediaService:
     def list_recordings(self) -> List[Path]:
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
         files = sorted(
-            RECORDINGS_DIR.glob("*.mp4"),
+            (p for p in RECORDINGS_DIR.glob("*.mp4") if not p.name.endswith(".temp.mp4")),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )

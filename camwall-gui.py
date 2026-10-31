@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import sys
 import subprocess
 from pathlib import Path
@@ -10,8 +11,10 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk
 
-from modules.paths import CONFIG_PATH
+from modules.paths import CONFIG_PATH, PID_DIR
 from modules.runtime_guard import runtime_summary, in_repo_but_not_running_repo_gui, show_gtk_warning
+from modules.wallpaper_engine import kill_existing
+from modules import stream_recorder
 
 # ---------------------------------------------------------------------------
 # Logging & Status-Dateien
@@ -257,6 +260,14 @@ class CamwallMainWindow(Gtk.Window):
         self.config_service = ConfigService()
         media_service = MediaService(cleanup_func=cleanup_recordings)
         preview_service = PreviewService(logger=log)
+        self.preview_service = preview_service
+        self._apply_procs: dict[str, subprocess.Popen] = {}
+
+        # Beim Start der GUI verwaiste Aufnahme-State-Dateien toter Prozesse bereinigen
+        try:
+            stream_recorder.cleanup_files()
+        except Exception:
+            pass
 
         self.config = self.config_service.config
         self.streams = self.config_service.get_streams()
@@ -333,15 +344,37 @@ class CamwallMainWindow(Gtk.Window):
         try:
             if RUN_FILE.exists():
                 RUN_FILE.unlink()
+            for grace_file in Path("/tmp").glob("camwall_grace_*"):
+                grace_file.unlink(missing_ok=True)
         except Exception:
             pass
+
+        try:
+            self.preview_service.stop_preview()
+        except Exception:
+            pass
+
+        try:
+            stream_recorder.stop_all_recordings()
+        except Exception as e:
+            log(f"Fehler beim Stoppen laufender Aufnahmen: {e}")
+
+        for mon_id, proc in list(self._apply_procs.items()):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        self._apply_procs.clear()
             
         try:
+            subprocess.run(["pkill", "-f", "camwall-apply"], check=False)
+            kill_existing(log)
             subprocess.run(["pkill", "-f", "xwinwrap"], check=False)
+            subprocess.run(["pkill", "-f", "/tmp/camwall_"], check=False)
             subprocess.run(["pkill", "-f", "mpv.*googlevideo"], check=False)
             subprocess.run(["pkill", "-f", "mpv.*youtube"], check=False)
             subprocess.run(["pkill", "-f", "camwall-overlay"], check=False)
-            subprocess.run(["pkill", "-f", "camwall-apply"], check=False)
         except Exception as e:
             log(f"Fehler beim Beenden: {e}")
 
@@ -384,20 +417,59 @@ class CamwallMainWindow(Gtk.Window):
             prev_id = combo.get_active_id() or "none"
             self._fill_monitor_combo(combo, prev_id)
 
+    def _is_wallpaper_running(self, mon_id: str) -> bool:
+        prev_apply = self._apply_procs.get(mon_id)
+        if prev_apply is not None and prev_apply.poll() is None:
+            return True
+        pidfile = PID_DIR / f"{mon_id}.pid"
+        if not pidfile.exists():
+            return False
+        try:
+            pid = int(pidfile.read_text().strip())
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
     def _run_apply(self, monitor_target=None) -> None:
-        cmd = _resolve_apply_target()
         if isinstance(monitor_target, list):
-            cmd.extend(monitor_target)
+            if not monitor_target:
+                return
+            targets = [str(m) for m in monitor_target if m]
         elif monitor_target:
-            cmd.append(str(monitor_target))
-        log(f"Starte camwall-apply: {cmd}")
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            targets = [str(monitor_target)]
+        else:
+            targets = list(self.monitor_combo_widgets.keys()) or ["left", "right"]
+
+        base_cmd = _resolve_apply_target()
+        for mon_id in targets:
+            try:
+                Path(f"/tmp/camwall_grace_{mon_id}").touch(exist_ok=True)
+            except Exception:
+                pass
+
+            prev_proc = self._apply_procs.get(mon_id)
+            if prev_proc is not None and prev_proc.poll() is None:
+                log(f"Breche noch laufenden camwall-apply für '{mon_id}' (PID {prev_proc.pid}) ab...")
+                try:
+                    prev_proc.terminate()
+                    prev_proc.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        prev_proc.kill()
+                    except Exception:
+                        pass
+
+            cmd = [*base_cmd, mon_id]
+            log(f"Starte camwall-apply: {cmd}")
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._apply_procs[mon_id] = proc
 
     def _restart_overlays(self, targets: list[str]) -> None:
         for mon_id in targets:
             mconf = (self.monitors or {}).get(mon_id, {})
             subprocess.run(["pkill", "-f", f"camwall-overlay.*{mon_id}"], check=False)
-            if mconf.get("overlay_autostart"):
+            if mconf.get("overlay_autostart") and mconf.get("stream_id", "none") != "none":
                 try:
                     overlay_cmd = _resolve_overlay_target()
                     overlay_cmd.append(mon_id)
@@ -436,7 +508,16 @@ class CamwallMainWindow(Gtk.Window):
             self._show_error_dialog(f"Refresh fehlgeschlagen:\n{e}")
 
     def _overlay_running(self, mon_id: str) -> bool:
-        return False
+        try:
+            res = subprocess.run(
+                ["pgrep", "-f", f"camwall-overlay.*{mon_id}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
 
     def _refresh_rec_stream_combo(self) -> None:
         combo = getattr(self, "rec_stream_combo", None)
@@ -467,23 +548,57 @@ class CamwallMainWindow(Gtk.Window):
             pass
 
         changed_monitors: list[str] = []
+        overlay_targets: list[str] = []
+
         for mon_id, combo in self.monitor_combo_widgets.items():
+            prev_mconf = dict((self.monitors or {}).get(mon_id) or {})
+            old_sid = prev_mconf.get("stream_id", "none") or "none"
+            old_overlay = bool(prev_mconf.get("overlay_autostart", False))
+
             new_sid = combo.get_active_id() or "none"
             overlay_flag = False
             chk = self.monitor_overlay_check_widgets.get(mon_id)
             if chk is not None:
                 overlay_flag = bool(chk.get_active())
+
             self.monitor_controller.assign_stream(mon_id, new_sid, overlay_flag)
-            changed_monitors.append(mon_id) 
+
+            if new_sid != old_sid:
+                try:
+                    if stream_recorder.is_recording_active(mon_id):
+                        stream_recorder.stop_recording(mon_id)
+                except Exception as e:
+                    log(f"Fehler beim Stoppen der Aufnahme auf Monitor {mon_id}: {e}")
+
+            running = self._is_wallpaper_running(mon_id)
+            stream_changed = (
+                new_sid != old_sid
+                or (new_sid != "none" and not running)
+                or (new_sid == "none" and running)
+            )
+            if stream_changed:
+                changed_monitors.append(mon_id)
+
+            overlay_running = self._overlay_running(mon_id)
+            overlay_changed = (
+                stream_changed
+                or overlay_flag != old_overlay
+                or (overlay_flag and new_sid != "none" and not overlay_running)
+                or ((not overlay_flag or new_sid == "none") and overlay_running)
+            )
+            if overlay_changed:
+                overlay_targets.append(mon_id)
 
         self.config["streams"] = self.streams
         self.monitor_controller.save_monitors()
         self.monitors = self.config_service.get_monitors()
 
         try:
-            self._run_apply(changed_monitors)
-            self._restart_overlays(changed_monitors)
-            self._set_status("Angewendet – Konfiguration gespeichert und neu gestartet.")
+            if changed_monitors:
+                self._run_apply(changed_monitors)
+            if overlay_targets:
+                self._restart_overlays(overlay_targets)
+            self._set_status("Angewendet – Konfiguration gespeichert und aktualisiert.")
         except Exception as e:
             self._show_error_dialog(f"Fehler: {e}")
 

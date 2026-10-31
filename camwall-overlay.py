@@ -20,16 +20,11 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk, GLib
 
-# Grafik-Engine für den Info-Stempel laden
 try:
     import cairo
     HAS_CAIRO = True
 except ImportError:
     HAS_CAIRO = False
-
-# ---------------------------------------------------------------------------
-# Pfade & Modul-Imports
-# ---------------------------------------------------------------------------
 
 BASE_APP_DIR = Path(__file__).resolve().parent
 if str(BASE_APP_DIR) not in sys.path:
@@ -41,10 +36,6 @@ try:
 except Exception as e:
     print("Fehler beim Import der Camwall-Module:", e, file=sys.stderr)
     sys.exit(1)
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 
 BASE_DIR = Path.home() / ".local" / "share" / "camwall"
 OVERLAY_LOG = BASE_DIR / "overlay.log"
@@ -60,9 +51,19 @@ def log(msg: str) -> None:
         pass
 
 
-# ---------------------------------------------------------------------------
-# Helfer: Stream / Monitor
-# ---------------------------------------------------------------------------
+def _resolve_apply_target() -> list[str]:
+    candidates = [
+        Path(__file__).resolve().with_name("camwall-apply.py"),
+        Path("/usr/local/bin/camwall-apply"),
+        Path("/opt/camwall/camwall-apply.py"),
+    ]
+    apply_path = next((p for p in candidates if p.exists()), None)
+    if not apply_path:
+        return ["camwall-apply"]
+    if apply_path.suffix == ".py":
+        return [sys.executable, str(apply_path)]
+    return [str(apply_path)]
+
 
 def _safe_title_for_filename(title: str) -> str:
     base = (
@@ -152,10 +153,6 @@ def get_monitor_rect_for_id(monitor_id: str):
         return rect
 
 
-# ---------------------------------------------------------------------------
-# Overlay-Fenster + Controller
-# ---------------------------------------------------------------------------
-
 class OverlayHoverController:
     def __init__(self, window: Gtk.Window, normal_opacity: float = 0.35, hover_opacity: float = 0.95, step: float = 0.1, interval_ms: int = 30):
         self.window = window
@@ -215,31 +212,62 @@ class OverlayHoverController:
 class OverlayRecorderController:
     def __init__(self, monitor_id: str):
         self.monitor_id = monitor_id
-        self.is_recording = False
+        self.is_stopping = False
+        self._apply_proc: subprocess.Popen | None = None
         self._sync_state_from_active_recording()
 
-    def _sync_state_from_active_recording(self):
+    def _sync_state_from_active_recording(self) -> bool:
         try:
-            active = stream_recorder._read_active_recording()
+            return bool(stream_recorder.is_recording_active(self.monitor_id))
         except Exception:
-            active = None
-        self.is_recording = bool(active)
+            return False
+
+    @property
+    def is_recording(self) -> bool:
+        if self.is_stopping:
+            return False
+        return self._sync_state_from_active_recording()
 
     def start_recording(self):
         config = load_config()
         url, browser, title = build_record_params(config, self.monitor_id)
-        meta = stream_recorder.start_recording(url, title, browser)
-        self.is_recording = True
+        meta = stream_recorder.start_recording(url, title, browser, self.monitor_id)
         return meta
 
     def stop_recording(self):
-        ok = stream_recorder.stop_recording()
-        self.is_recording = False
-        return ok
+        self.is_stopping = True
+        try:
+            return stream_recorder.stop_recording(self.monitor_id)
+        finally:
+            self.is_stopping = False
 
     def refresh_background(self):
-        subprocess.Popen(
-            ["/usr/bin/env", "python3", "/opt/camwall/camwall-apply.py"],
+        # Vorher war hier der Pfad zu camwall-apply.py hart auf
+        # /opt/camwall/camwall-apply.py codiert. In der Entwicklungsumgebung
+        # (Repo-Checkout) existiert dieser Pfad nicht, wodurch der
+        # Refresh-Button im Overlay fehlschlug. _resolve_apply_target()
+        # sucht - wie auch in camwall-gui.py und camwall-watchdog.py - erst
+        # im Repo-Verzeichnis und fällt erst danach auf die installierten
+        # Pfade zurück.
+        try:
+            Path(f"/tmp/camwall_grace_{self.monitor_id}").touch(exist_ok=True)
+        except Exception:
+            pass
+
+        if self._apply_proc is not None and self._apply_proc.poll() is None:
+            try:
+                self._apply_proc.terminate()
+                self._apply_proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    self._apply_proc.kill()
+                except Exception:
+                    pass
+
+        cmd = _resolve_apply_target()
+        cmd.append(self.monitor_id)
+        self._apply_proc = subprocess.Popen(
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -250,7 +278,11 @@ class OverlayWindow(Gtk.Window):
         super().__init__(title="Camwall Recorder")
         self.monitor_id = monitor_id
 
-        # Controller
+        self._blink_timer = None
+        self._blink_state = False
+        self._displayed_recording_state = False
+        self._sync_timer = None
+
         self.hover_controller = OverlayHoverController(self)
         self.recorder_controller = OverlayRecorderController(monitor_id)
 
@@ -266,25 +298,20 @@ class OverlayWindow(Gtk.Window):
         except Exception:
             pass
 
-        # Haupt-Container
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(main_vbox)
 
-        # Obere Leiste
         top_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top_box.set_border_width(8)
         main_vbox.pack_start(top_box, False, False, 0)
 
-        # Statuslabel
         self.label_status = Gtk.Label()
         self.label_status.set_xalign(0)
         top_box.pack_start(self.label_status, True, True, 0)
 
-        # Button-Leiste
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         top_box.pack_start(btn_box, False, False, 0)
 
-        # Aufnahme starten
         self.btn_record = Gtk.Button()
         img_rec = Gtk.Image.new_from_icon_name("media-record", Gtk.IconSize.BUTTON)
         self.btn_record.set_image(img_rec)
@@ -293,7 +320,6 @@ class OverlayWindow(Gtk.Window):
         self.btn_record.connect("clicked", self.on_record_clicked)
         btn_box.pack_start(self.btn_record, False, False, 0)
 
-        # Aufnahme stoppen
         self.btn_stop = Gtk.Button()
         img_stop = Gtk.Image.new_from_icon_name("media-playback-stop", Gtk.IconSize.BUTTON)
         self.btn_stop.set_image(img_stop)
@@ -302,7 +328,6 @@ class OverlayWindow(Gtk.Window):
         self.btn_stop.connect("clicked", self.on_stop_clicked)
         btn_box.pack_start(self.btn_stop, False, False, 0)
 
-        # Sofort-Screenshot
         self.btn_shot = Gtk.Button()
         img_shot = Gtk.Image.new_from_icon_name("camera-photo", Gtk.IconSize.BUTTON)
         self.btn_shot.set_image(img_shot)
@@ -311,7 +336,6 @@ class OverlayWindow(Gtk.Window):
         self.btn_shot.connect("clicked", self.on_shot_clicked)
         btn_box.pack_start(self.btn_shot, False, False, 0)
 
-        # Refresh
         self.btn_refresh = Gtk.Button()
         img_ref = Gtk.Image.new_from_icon_name("view-refresh", Gtk.IconSize.BUTTON)
         self.btn_refresh.set_image(img_ref)
@@ -320,7 +344,6 @@ class OverlayWindow(Gtk.Window):
         self.btn_refresh.connect("clicked", self.on_refresh_clicked)
         btn_box.pack_start(self.btn_refresh, False, False, 0)
 
-        # Audio Toggle Button
         self.btn_audio = Gtk.ToggleButton()
         img_audio = Gtk.Image.new_from_icon_name("audio-volume-muted", Gtk.IconSize.BUTTON)
         self.btn_audio.set_image(img_audio)
@@ -329,7 +352,6 @@ class OverlayWindow(Gtk.Window):
         self.btn_audio.connect("toggled", self.on_audio_toggled)
         btn_box.pack_start(self.btn_audio, False, False, 0)
 
-        # Info Toggle Button
         self.btn_info = Gtk.ToggleButton()
         img_info = Gtk.Image.new_from_icon_name("dialog-information", Gtk.IconSize.BUTTON)
         self.btn_info.set_image(img_info)
@@ -338,7 +360,6 @@ class OverlayWindow(Gtk.Window):
         self.btn_info.connect("toggled", self.on_info_toggled)
         btn_box.pack_start(self.btn_info, False, False, 0)
 
-        # Info Panel (ausklappbar)
         self.info_revealer = Gtk.Revealer()
         self.info_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         self.info_revealer.set_transition_duration(300)
@@ -360,17 +381,39 @@ class OverlayWindow(Gtk.Window):
         self.connect("enter-notify-event", self.hover_controller.on_mouse_enter)
         self.connect("leave-notify-event", self.hover_controller.on_mouse_leave)
 
-        self.connect("destroy", Gtk.main_quit)
+        self.connect("destroy", self._on_destroy)
 
         self._update_status_label()
         self.show_all()
 
         GLib.idle_add(self._position_and_set_opacity)
+        self._sync_timer = GLib.timeout_add(1000, self._poll_recording_state)
 
 
-    # ------------------------------------------------------------------
-    # IPC Magie (Fernbedienung für mpv)
-    # ------------------------------------------------------------------
+    def _on_destroy(self, *_args):
+        if self._sync_timer is not None:
+            try:
+                GLib.source_remove(self._sync_timer)
+            except Exception:
+                pass
+            self._sync_timer = None
+        if self._blink_timer is not None:
+            try:
+                GLib.source_remove(self._blink_timer)
+            except Exception:
+                pass
+            self._blink_timer = None
+        Gtk.main_quit()
+
+    def _poll_recording_state(self):
+        if self.recorder_controller.is_stopping:
+            return True
+        live_active = self.recorder_controller.is_recording
+        blink_running = self._blink_timer is not None
+        if live_active != self._displayed_recording_state or live_active != blink_running:
+            self._update_status_label()
+        return True
+
 
     def _send_ipc_command(self, command: list) -> bool:
         sock_path = f"/tmp/camwall_{self.monitor_id}.sock"
@@ -401,15 +444,8 @@ class OverlayWindow(Gtk.Window):
         else:
             log("Overlay: IPC Befehl fehlgeschlagen, mpv reagiert nicht.")
 
-
-    # ------------------------------------------------------------------
-    # Sofort-Kamera & Info-Stempel
-    # ------------------------------------------------------------------
-
     def on_shot_clicked(self, button=None):
-        # Zeige sofort visuelles Feedback, dass geklickt wurde
         self._update_status_label("📸 Klick...")
-        # Starte den Vorgang im Hintergrund, um GUI nicht zu blockieren
         threading.Thread(target=self._perform_instant_screenshot, daemon=True).start()
 
     def _perform_instant_screenshot(self):
@@ -420,7 +456,6 @@ class OverlayWindow(Gtk.Window):
             GLib.idle_add(self._show_error_dialog, str(e))
             return
 
-        # 1. Pfad generieren
         stream_name = sconf.get("name", self.monitor_id)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         safe_title = _safe_title_for_filename(stream_name)
@@ -429,20 +464,19 @@ class OverlayWindow(Gtk.Window):
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{ts}_{safe_title}.png"
         
-        # 2. Latenzfreien Screenshot über mpv auslösen!
         success = self._send_ipc_command(["screenshot-to-file", str(out_path), "video"])
         if not success:
-            GLib.idle_add(self._show_error_dialog, "Sofort-Kamera fehlgeschlagen. Ist der Stream aktiv (und angewendet)?")
+            GLib.idle_add(self._show_error_dialog, "Sofort-Kamera fehlgeschlagen. Ist der Stream aktiv?")
             GLib.idle_add(self._update_status_label, "Fehler")
             return
             
-        # 3. Warten, bis mpv die Datei auf die SSD geschrieben hat (max. 2 Sekunden)
         file_written = False
-        for _ in range(20):
-            if out_path.exists():
+        for _ in range(30):
+            if out_path.exists() and out_path.stat().st_size > 10000:
+                time.sleep(0.3)
                 file_written = True
                 break
-            time.sleep(0.1)
+            time.sleep(0.2)
             
         if not file_written:
             GLib.idle_add(self._show_error_dialog, "mpv hat keine Bilddatei erstellt.")
@@ -451,7 +485,6 @@ class OverlayWindow(Gtk.Window):
 
         GLib.idle_add(self._update_status_label, "Stemple Infos...")
 
-        # 4. Daten für den Info-Stempel zusammenstellen
         loc = sconf.get("location", "").strip()
         tz_str = sconf.get("timezone", "").strip()
         
@@ -475,44 +508,37 @@ class OverlayWindow(Gtk.Window):
             except Exception:
                 pass
 
-        # 5. Stempel mit cairo aufdrucken (falls möglich)
         if HAS_CAIRO and (loc or tz_str):
             try:
                 surface = cairo.ImageSurface.create_from_png(str(out_path))
                 ctx = cairo.Context(surface)
                 
-                # Schrift konfigurieren
                 ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
                 ctx.set_font_size(24)
                 
-                # Zeilen bauen
                 lines = [stream_name]
                 if loc: lines.append(f"Ort: {loc}")
                 if time_str: lines.append(f"Zeit: {time_str}")
                 if weather_str: lines.append(f"Wetter: {weather_str}")
                 
-                # Kasten-Größe berechnen
                 max_w = 0
                 total_h = 0
                 for line in lines:
                     ext = ctx.text_extents(line)
                     max_w = max(max_w, ext.width)
-                    total_h += 30 # feste Zeilenhöhe
+                    total_h += 30
                     
                 pad = 15
                 box_w = max_w + (pad * 2)
                 box_h = total_h + (pad * 2) - 10
                 
-                # Unten rechts platzieren
                 x = surface.get_width() - box_w - 30
                 y = surface.get_height() - box_h - 30
                 
-                # Halbtransparenter schwarzer Hintergrund
                 ctx.set_source_rgba(0, 0, 0, 0.65)
                 ctx.rectangle(x, y, box_w, box_h)
                 ctx.fill()
                 
-                # Weißer Text
                 ctx.set_source_rgba(1, 1, 1, 1)
                 curr_y = y + pad + 20
                 for line in lines:
@@ -524,24 +550,31 @@ class OverlayWindow(Gtk.Window):
             except Exception as e:
                 log(f"Fehler beim Aufdrucken des Info-Stempels: {e}")
 
-        # Fertig!
         GLib.idle_add(self._update_status_label, "Screenshot fertig")
-        GLib.idle_add(self._show_info_dialog, f"Sofort-Screenshot erstellt:\n{out_path}")
+        
+        # HIER IST DER NEUE TOAST-DIALOG: modal=False blockiert nichts mehr!
+        GLib.idle_add(self._show_toast_dialog, f"Sofort-Screenshot erstellt:\n{out_path.name}")
+
+    def _show_toast_dialog(self, text: str):
+        dlg = Gtk.MessageDialog(
+            transient_for=self, 
+            modal=False, 
+            message_type=Gtk.MessageType.INFO, 
+            buttons=Gtk.ButtonsType.NONE, 
+            text=text
+        )
+        dlg.show_all()
+        # Zerstört den Dialog verlässlich nach 2500 Millisekunden
+        def close_dlg():
+            dlg.destroy()
+            return False
+        GLib.timeout_add(2500, close_dlg)
 
     def _show_error_dialog(self, text: str):
         dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text=text)
         dlg.run()
         dlg.destroy()
 
-    def _show_info_dialog(self, text: str):
-        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text=text)
-        dlg.run()
-        dlg.destroy()
-
-
-    # ------------------------------------------------------------------
-    # Info Panel Magie (Wetter & Zeit)
-    # ------------------------------------------------------------------
 
     def on_info_toggled(self, button):
         if button.get_active():
@@ -610,10 +643,6 @@ class OverlayWindow(Gtk.Window):
         GLib.timeout_add(50, self._position_and_set_opacity)
 
 
-    # ------------------------------------------------------------------
-    # Positionierung + initiale Transparenz
-    # ------------------------------------------------------------------
-
     def _position_and_set_opacity(self):
         try:
             rect = get_monitor_rect_for_id(self.monitor_id)
@@ -631,9 +660,13 @@ class OverlayWindow(Gtk.Window):
             self.set_position(Gtk.WindowPosition.CENTER)
         return False
 
-    # ------------------------------------------------------------------
-    # Status / Buttons / Rechtsklick / DOPPELKLICK
-    # ------------------------------------------------------------------
+
+    def _set_record_btn_opacity(self, opacity: float) -> None:
+        self.btn_record.set_opacity(opacity)
+        img = self.btn_record.get_image()
+        if img is not None:
+            img.set_opacity(opacity)
+        self.btn_record.queue_draw()
 
     def _update_status_label(self, extra: str = ""):
         try:
@@ -644,24 +677,55 @@ class OverlayWindow(Gtk.Window):
         except Exception:
             monitor_name = self.monitor_id
 
-        rec_text = "Aufnahme: an" if self.recorder_controller.is_recording else "Bereit."
+        is_rec = self.recorder_controller.is_recording
+        self._displayed_recording_state = is_rec
+
+        if self.recorder_controller.is_stopping:
+            rec_text = "Stoppe …"
+        elif is_rec:
+            rec_text = "Aufnahme: an"
+        else:
+            rec_text = "Bereit."
+
         txt = f"{monitor_name} – {rec_text}"
         if extra:
             txt += f" ({extra})"
         self.label_status.set_text(txt)
 
-        self.btn_record.set_sensitive(not self.recorder_controller.is_recording)
-        self.btn_stop.set_sensitive(self.recorder_controller.is_recording)
+        # HIER IST DER TRICK FÜRS BLINKEN: btn_record bleibt aktiv (wird nicht grau)!
+        self.btn_stop.set_sensitive(is_rec and not self.recorder_controller.is_stopping)
+
+        if is_rec:
+            if not self._blink_timer:
+                self._blink_state = False
+                self._set_record_btn_opacity(0.15)
+                self._blink_timer = GLib.timeout_add(700, self._on_blink_record)
+        else:
+            if self._blink_timer:
+                GLib.source_remove(self._blink_timer)
+                self._blink_timer = None
+            self._blink_state = False
+            self._set_record_btn_opacity(1.0)
+
+    def _on_blink_record(self):
+        if not self.recorder_controller.is_recording:
+            self._blink_timer = None
+            self._blink_state = False
+            self._set_record_btn_opacity(1.0)
+            self._update_status_label()
+            return False
+        self._blink_state = not self._blink_state
+        self._set_record_btn_opacity(1.0 if self._blink_state else 0.15)
+        return True
+
 
     def on_button_press_event(self, widget, event):
-        # 1. Rechtsklick (Kontextmenü)
         if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
             menu = self.build_context_menu()
             menu.show_all()
             menu.popup_at_pointer(event)
             return True
             
-        # 2. NEU: Doppelklick irgendwo im Overlay löst Screenshot aus
         if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
             self.on_shot_clicked()
             return True
@@ -718,14 +782,40 @@ class OverlayWindow(Gtk.Window):
         self.hover_controller.set_initial_opacity()
 
     def on_record_clicked(self, button):
-        self.recorder_controller.start_recording()
-        self._update_status_label("gestartet")
+        if self.recorder_controller.is_stopping or self.recorder_controller.is_recording:
+            return
+            
+        try:
+            self.recorder_controller.start_recording()
+            self._update_status_label("gestartet")
+        except Exception as e:
+            log(f"Crash bei Aufnahme: {e}")
+            self._update_status_label("Fehler")
+            self._show_error_dialog(f"Fehler beim Starten der Aufnahme:\n{e}")
 
     def on_stop_clicked(self, button):
-        if self.recorder_controller.stop_recording():
-            self._update_status_label("gestoppt")
-        else:
+        if self.recorder_controller.is_stopping:
+            return
+        if not self.recorder_controller.is_recording:
             self._update_status_label("keine aktiv")
+            return
+
+        self.recorder_controller.is_stopping = True
+        self._update_status_label()
+
+        def _stop_worker():
+            ok = False
+            try:
+                ok = self.recorder_controller.stop_recording()
+            except Exception as e:
+                log(f"Fehler beim Stoppen der Aufnahme: {e}")
+            GLib.idle_add(self._on_stop_completed, ok)
+
+        threading.Thread(target=_stop_worker, daemon=True).start()
+
+    def _on_stop_completed(self, ok: bool):
+        self._update_status_label("gestoppt" if ok else "keine aktiv")
+        return False
 
     def on_refresh_clicked(self, button):
         self.recorder_controller.refresh_background()
